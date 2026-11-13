@@ -5,6 +5,7 @@ Used by .github/workflows/ci.yml (standard library only, no install needed):
 
   ci_report.py section <tool> <report.json>   one tool's findings (for the job summary)
   ci_report.py comment <reports-dir>          the full PR comment (job results come from $NEEDS)
+  ci_report.py gate bandit <report.json>      exit 1 if there is any HIGH severity finding
 
 <tool> is one of: hadolint, bandit, gitleaks, trivy, sbom.
 """
@@ -20,10 +21,10 @@ SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4,
 
 # tool -> (title, report file name)
 TOOLS = {
-    "gitleaks": ("Gitleaks — secrets in git history", "gitleaks.json"),
-    "hadolint": ("Hadolint — Dockerfile lint", "hadolint.json"),
-    "bandit": ("Bandit — Python code (MEDIUM+)", "bandit.json"),
-    "trivy": ("Trivy — image vulnerabilities (HIGH+, fixable)", "trivy.json"),
+    "gitleaks": ("Gitleaks — secrets in git history (fails on any secret)", "gitleaks.json"),
+    "hadolint": ("Hadolint — Dockerfile lint (fails on error)", "hadolint.json"),
+    "bandit": ("Bandit — Python code (fails on HIGH)", "bandit.json"),
+    "trivy": ("Trivy — image vulnerabilities, fixable HIGH/CRITICAL (fails on any)", "trivy.json"),
     "sbom": ("Syft — SBOM", "sbom.spdx.json"),
 }
 
@@ -133,5 +134,12 @@ if __name__ == "__main__":
         print(section(sys.argv[2], sys.argv[3]))
     elif len(sys.argv) == 3 and sys.argv[1] == "comment":
         print(comment(sys.argv[2]))
+    elif len(sys.argv) == 4 and sys.argv[1:3] == ["gate", "bandit"]:
+        _, rows = parse_bandit(json.loads(Path(sys.argv[3]).read_text()))
+        high = [r for r in rows if r[0] == "HIGH"]
+        for severity, rule, location, issue in high:
+            print(f"::error::{rule} at {location}: {issue}")
+        print(f"{len(high)} HIGH severity finding(s), {len(rows) - len(high)} lower (not blocking).")
+        sys.exit(1 if high else 0)
     else:
         sys.exit(__doc__)

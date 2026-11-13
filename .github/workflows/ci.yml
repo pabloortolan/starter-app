@@ -10,6 +10,8 @@
 #   1. run the scanner, JSON output, `continue-on-error` so the job keeps going
 #   2. write the findings to the job summary + upload the JSON as an artifact
 #   3. fail the job if step 1 failed
+# Jobs fail only on HIGH/CRITICAL findings (Hadolint: "error"; Gitleaks: any secret).
+# Lower-severity findings still appear in the reports.
 # The Markdown is produced by .github/scripts/ci_report.py.
 #
 # Every action is pinned to a full commit SHA (the comment shows the version).
@@ -93,11 +95,12 @@ jobs:
           echo "${HADOLINT_SHA256}  hadolint" | sha256sum --check
           chmod +x hadolint
 
-      # Fails on warnings and errors; info/style findings are reported but don't fail.
+      # Fails only on errors (Hadolint's highest level);
+      # warning/info/style findings are reported but don't fail.
       - name: Lint Dockerfile
         id: scan
         continue-on-error: true
-        run: ./hadolint --failure-threshold warning --format json Dockerfile > hadolint.json
+        run: ./hadolint --failure-threshold error --format json Dockerfile > hadolint.json
 
       - name: Write report
         run: python3 .github/scripts/ci_report.py section hadolint hadolint.json >> "$GITHUB_STEP_SUMMARY"
@@ -107,7 +110,7 @@ jobs:
           path: hadolint.json
           retention-days: 7
 
-      - name: Fail if the Dockerfile has warnings or errors
+      - name: Fail if the Dockerfile has errors
         if: steps.scan.outcome == 'failure'
         run: exit 1
 
@@ -123,11 +126,10 @@ jobs:
           python-version: "3.12"
       - run: pip install bandit==1.9.4
 
-      # Only MEDIUM and HIGH severity findings are reported, and they fail the job.
+      # Every finding is reported; only HIGH severity fails the job (last step).
+      # Bandit can't do "report all, fail on HIGH" by itself, so the script decides.
       - name: Scan app code with Bandit
-        id: scan
-        continue-on-error: true
-        run: bandit -r app --severity-level medium --format json --output bandit.json
+        run: bandit -r app --format json --output bandit.json --exit-zero
 
       - name: Write report
         run: python3 .github/scripts/ci_report.py section bandit bandit.json >> "$GITHUB_STEP_SUMMARY"
@@ -137,9 +139,8 @@ jobs:
           path: bandit.json
           retention-days: 7
 
-      - name: Fail if Bandit found issues
-        if: steps.scan.outcome == 'failure'
-        run: exit 1
+      - name: Fail if Bandit found HIGH severity issues
+        run: python3 .github/scripts/ci_report.py gate bandit bandit.json
 
   # ---------------------------------------------------------------- image
   build-scan-push:

@@ -1,7 +1,12 @@
-# CI/CD pipeline: runs on GitHub's servers every time you push.
-#  1. test  -> runs the unit tests
-#  2. build -> builds the Docker image and publishes it to
-#              GitHub Container Registry (ghcr.io), only on the main branch
+# CI/CD pipeline with security checks.
+#
+#   test ─────┐
+#             ├──► build image ──► Syft (SBOM) ──► Trivy (vulnerabilities) ──► push (main only)
+#   gitleaks ─┘
+#
+# Every action is pinned to a full commit SHA (the comment shows the version).
+# A tag like @v4 can be moved by whoever controls the repository; a SHA cannot.
+# Dependabot (github-actions ecosystem) keeps these SHAs up to date for you.
 name: CI
 
 on:
@@ -9,43 +14,105 @@ on:
     branches: [main]
   pull_request:
 
+# Default: read-only token. Jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
 jobs:
+  # ---------------------------------------------------------------- tests
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: pytest -v
 
-  build-and-push:
-    needs: test
-    if: github.ref == 'refs/heads/main'
+  # ---------------------------------------------------------------- secrets
+  # Runs the open-source Gitleaks CLI (MIT license) directly.
+  # (The official gitleaks-action is not open source since v2.)
+  gitleaks:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history: scan every commit, not just the last one
+
+      - name: Install Gitleaks (download + verify checksum)
+        run: |
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$file"
+          echo "${GITLEAKS_SHA256}  $file" | sha256sum --check
+          tar -xzf "$file" gitleaks
+
+      - name: Scan git history for secrets
+        run: ./gitleaks git --redact --verbose .
+
+  # ---------------------------------------------------------------- image
+  build-scan-push:
+    needs: [test, gitleaks]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write # to push to ghcr.io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Image name must be lowercase
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # 1. Build the image locally on the runner. Nothing is published yet.
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      # 2. Syft: list every package inside the image (SBOM).
+      #    Downloadable from the run page, under "Artifacts".
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@fffec3d851af758d56fee099cf3fbf8aa8779843 # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          syft-version: v1.57.1
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom.spdx.json
+          upload-release-assets: false
+
+      # 3. Trivy: fail if the image has HIGH or CRITICAL vulnerabilities
+      #    that already have a fix available.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          version: v0.76.2
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # 4. Publish, only on main and only if every check above passed.
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image name must be lowercase
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          build-args: APP_VERSION=${{ github.sha }}
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: docker push --all-tags "$IMAGE"

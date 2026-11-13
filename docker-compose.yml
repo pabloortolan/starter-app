@@ -1,0 +1,23 @@
+# Runs the whole stack (web app + Redis database) with one command:
+#   docker compose up --build
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"          # host:container -> open http://localhost:8000
+    environment:
+      REDIS_HOST: redis      # containers find each other by service name
+      APP_ENV: docker-compose
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data     # data survives "docker compose down"
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+
+volumes:
+  redis-data:

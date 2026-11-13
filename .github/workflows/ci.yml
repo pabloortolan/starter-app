@@ -1,8 +1,16 @@
 # CI/CD pipeline with security checks.
 #
-#   test ─────┐
-#             ├──► build image ──► Syft (SBOM) ──► Trivy (vulnerabilities) ──► push (main only)
-#   gitleaks ─┘
+#   test ──────┐
+#   gitleaks ──┤
+#   hadolint ──┼──► build image ──► Syft (SBOM) ──► Trivy (vulnerabilities) ──► push (main only)
+#   bandit ────┘
+#                         all of the above ──► pr-summary (one comment on the PR)
+#
+# Every scan job follows the same pattern, so a report exists even when the scan fails:
+#   1. run the scanner, JSON output, `continue-on-error` so the job keeps going
+#   2. write the findings to the job summary + upload the JSON as an artifact
+#   3. fail the job if step 1 failed
+# The Markdown is produced by .github/scripts/ci_report.py.
 #
 # Every action is pinned to a full commit SHA (the comment shows the version).
 # A tag like @v4 can be moved by whoever controls the repository; a SHA cannot.
@@ -51,11 +59,91 @@ jobs:
           tar -xzf "$file" gitleaks
 
       - name: Scan git history for secrets
-        run: ./gitleaks git --redact --verbose .
+        id: scan
+        continue-on-error: true
+        # --redact keeps the secret values out of the log and the report.
+        run: ./gitleaks git --redact --verbose --report-format json --report-path gitleaks.json .
+
+      - name: Write report
+        run: python3 .github/scripts/ci_report.py section gitleaks gitleaks.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-gitleaks
+          path: gitleaks.json
+          retention-days: 7
+
+      - name: Fail if secrets were found
+        if: steps.scan.outcome == 'failure'
+        run: exit 1
+
+  # ---------------------------------------------------------------- Dockerfile lint
+  # Hadolint checks the Dockerfile against best practices
+  # (pinned versions, no root user, clean apt caches, ...).
+  hadolint:
+    runs-on: ubuntu-latest
+    env:
+      HADOLINT_VERSION: "2.15.1"
+      HADOLINT_SHA256: "c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Hadolint (download + verify checksum)
+        run: |
+          curl -sSfL -o hadolint "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-x86_64"
+          echo "${HADOLINT_SHA256}  hadolint" | sha256sum --check
+          chmod +x hadolint
+
+      # Fails on warnings and errors; info/style findings are reported but don't fail.
+      - name: Lint Dockerfile
+        id: scan
+        continue-on-error: true
+        run: ./hadolint --failure-threshold warning --format json Dockerfile > hadolint.json
+
+      - name: Write report
+        run: python3 .github/scripts/ci_report.py section hadolint hadolint.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-hadolint
+          path: hadolint.json
+          retention-days: 7
+
+      - name: Fail if the Dockerfile has warnings or errors
+        if: steps.scan.outcome == 'failure'
+        run: exit 1
+
+  # ---------------------------------------------------------------- Python SAST
+  # Bandit scans the Python source for common security issues
+  # (eval, shell=True, hardcoded passwords, debug=True, weak crypto, ...).
+  bandit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: pip install bandit==1.9.4
+
+      # Only MEDIUM and HIGH severity findings are reported, and they fail the job.
+      - name: Scan app code with Bandit
+        id: scan
+        continue-on-error: true
+        run: bandit -r app --severity-level medium --format json --output bandit.json
+
+      - name: Write report
+        run: python3 .github/scripts/ci_report.py section bandit bandit.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-bandit
+          path: bandit.json
+          retention-days: 7
+
+      - name: Fail if Bandit found issues
+        if: steps.scan.outcome == 'failure'
+        run: exit 1
 
   # ---------------------------------------------------------------- image
   build-scan-push:
-    needs: [test, gitleaks]
+    needs: [test, gitleaks, hadolint, bandit]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -95,6 +183,8 @@ jobs:
       # 3. Trivy: fail if the image has HIGH or CRITICAL vulnerabilities
       #    that already have a fix available.
       - name: Scan image with Trivy
+        id: scan
+        continue-on-error: true
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           version: v0.76.2
@@ -102,7 +192,24 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
-          format: table
+          format: json
+          output: trivy.json
+
+      - name: Write report
+        run: |
+          python3 .github/scripts/ci_report.py section sbom sbom.spdx.json >> "$GITHUB_STEP_SUMMARY"
+          python3 .github/scripts/ci_report.py section trivy trivy.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report-image
+          path: |
+            trivy.json
+            sbom.spdx.json
+          retention-days: 7
+
+      - name: Fail if Trivy found vulnerabilities
+        if: steps.scan.outcome == 'failure'
+        run: exit 1
 
       # 4. Publish, only on main and only if every check above passed.
       - name: Log in to GitHub Container Registry
@@ -116,3 +223,52 @@ jobs:
       - name: Push image
         if: github.ref == 'refs/heads/main'
         run: docker push --all-tags "$IMAGE"
+
+  # ---------------------------------------------------------------- PR comment
+  # Collects every report and posts ONE comment on the PR.
+  # On the next push the same comment is edited, not duplicated.
+  pr-summary:
+    needs: [test, gitleaks, hadolint, bandit, build-scan-push]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # to comment on the PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Build comment
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/ci_report.py comment reports > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      # PRs from forks get a read-only token and can't comment:
+      # for those, the summary is only on the workflow run page.
+      - name: Post or update PR comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- ci-security-summary -->"))) | .id' \
+            | head -n 1)
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md > /dev/null
+            echo "Updated comment $id"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md > /dev/null
+            echo "Created comment"
+          fi

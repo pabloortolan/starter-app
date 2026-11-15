@@ -15,7 +15,9 @@ WORKDIR /app
 # Install dependencies first: Docker caches this layer,
 # so rebuilding after a code change is fast.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir -r requirements.txt \
+  && pip uninstall -y pip
 
 # Copy the application code
 COPY app/ ./app/

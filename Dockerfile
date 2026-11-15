@@ -1,6 +1,11 @@
 # ---- Base image: a small official Python image ----
 FROM python:3.12-slim
 
+# Apply Debian security updates not yet included in the base image
+RUN apt-get update \
+  && apt-get upgrade -y \
+  && rm -rf /var/lib/apt/lists/*
+
 # Don't write .pyc files and show logs immediately
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1

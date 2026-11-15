@@ -94,4 +94,7 @@ def create_app(redis_client=None):
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
+    app.run(
+    host="0.0.0.0",  # nosec B104 - must listen on all interfaces inside a container
+    port=int(os.getenv("PORT", "8000")),
+    debug=os.getenv("FLASK_DEBUG") == "1")
